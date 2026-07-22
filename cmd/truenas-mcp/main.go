@@ -2,12 +2,12 @@ package main
 
 import (
 	"bufio"
-	"crypto/tls"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -20,7 +20,8 @@ import (
 var (
 	truenasURL = flag.String("truenas-url", "", "TrueNAS hostname or WebSocket URL (e.g., 'truenas.local' or 'ws://10.0.0.1/websocket')")
 	apiKey     = flag.String("api-key", "", "TrueNAS API key for middleware authentication")
-	insecure   = flag.Bool("insecure", false, "Skip TLS certificate verification (for self-signed certs)")
+	insecure   = flag.Bool("insecure", false, "Disable TLS certificate verification (UNSAFE: allows man-in-the-middle attacks)")
+	tlsCA      = flag.String("tls-ca", "", "Path to a PEM certificate to trust (e.g., the TrueNAS self-signed certificate)")
 	versionFlg = flag.Bool("version", false, "Print version and exit")
 	debug      = flag.Bool("debug", false, "Enable debug logging")
 )
@@ -56,12 +57,26 @@ func main() {
 	}
 	truenas.SetDebugLogging(*debug)
 
-	// Configure TLS - accept self-signed certs by default (common for TrueNAS)
-	tlsConfig := &tls.Config{
-		InsecureSkipVerify: true,
+	if *tlsCA == "" {
+		*tlsCA = os.Getenv("TRUENAS_TLS_CA")
+	}
+	if !*insecure {
+		switch strings.ToLower(os.Getenv("TRUENAS_INSECURE")) {
+		case "", "0", "false", "no", "off":
+		default:
+			*insecure = true
+		}
+	}
+
+	// Configure TLS: certificates are verified by default. TrueNAS ships a
+	// self-signed certificate, so users must either trust it via --tls-ca
+	// or explicitly opt out of verification with --insecure.
+	tlsConfig, err := truenas.NewTLSConfig(*insecure, *tlsCA)
+	if err != nil {
+		log.Fatalf("Failed to configure TLS: %v", err)
 	}
 	if *insecure {
-		log.Println("TLS certificate verification disabled (self-signed certs accepted)")
+		log.Println("WARNING: TLS certificate verification disabled - the connection is vulnerable to man-in-the-middle attacks; prefer --tls-ca with the server's certificate")
 	}
 
 	// Create TrueNAS client
