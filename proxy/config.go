@@ -5,6 +5,8 @@ import (
 	"flag"
 	"os"
 	"time"
+
+	"github.com/truenas/truenas-mcp/truenas"
 )
 
 // Config holds proxy configuration
@@ -47,7 +49,8 @@ func LoadConfig() (*Config, error) {
 	}
 
 	cfg.Timeout = *timeout
-	cfg.Debug = *debug
+	// TRUENAS_MCP_DEBUG=1 is equivalent to --debug
+	cfg.Debug = *debug || truenas.DebugLogging()
 	cfg.Insecure = *insecure
 
 	// Validate required fields

@@ -10,6 +10,7 @@ import (
 	"sync"
 
 	"github.com/truenas/truenas-mcp/mcp"
+	"github.com/truenas/truenas-mcp/truenas"
 )
 
 // StdioHandler manages stdin/stdout communication
@@ -38,7 +39,7 @@ func (h *StdioHandler) ReadRequest() (*mcp.Request, error) {
 
 	line := h.stdin.Bytes()
 	if h.debug {
-		log.Printf("[STDIN] %s", string(line))
+		log.Printf("[STDIN] %s", truenas.RedactJSONForLog(line))
 	}
 
 	var req mcp.Request
@@ -60,7 +61,7 @@ func (h *StdioHandler) WriteResponse(resp *mcp.Response) error {
 	}
 
 	if h.debug {
-		log.Printf("[STDOUT] %s", string(data))
+		log.Printf("[STDOUT] %s", truenas.RedactJSONForLog(data))
 	}
 
 	_, err = fmt.Fprintf(os.Stdout, "%s\n", data)

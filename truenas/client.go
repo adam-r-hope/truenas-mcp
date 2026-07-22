@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -12,6 +13,27 @@ import (
 
 	"github.com/gorilla/websocket"
 )
+
+// debugLogging controls whether full request/response bodies are written to
+// the log. Off by default: normal operation logs only metadata (method, id,
+// result size). Enabled via the TRUENAS_MCP_DEBUG environment variable or the
+// --debug flag (see SetDebugLogging). Even when enabled, credential-bearing
+// values are redacted before logging.
+var debugLogging atomic.Bool
+
+func init() {
+	switch strings.ToLower(os.Getenv("TRUENAS_MCP_DEBUG")) {
+	case "", "0", "false", "no", "off":
+	default:
+		debugLogging.Store(true)
+	}
+}
+
+// SetDebugLogging enables or disables verbose request/response body logging.
+func SetDebugLogging(enabled bool) { debugLogging.Store(enabled) }
+
+// DebugLogging reports whether verbose body logging is enabled.
+func DebugLogging() bool { return debugLogging.Load() }
 
 type Client struct {
 	endpoint  string
@@ -122,7 +144,9 @@ func (c *Client) connect() error {
 			Version: "1",
 			Support: []string{"1"},
 		}
-		log.Printf("Sending connect message: %+v", connectMsg)
+		if debugLogging.Load() {
+			log.Printf("Sending connect message: %+v", connectMsg)
+		}
 		if err := conn.WriteJSON(connectMsg); err != nil {
 			conn.Close()
 			lastErr = fmt.Errorf("failed to send connect message: %w", err)
@@ -136,7 +160,9 @@ func (c *Client) connect() error {
 			lastErr = fmt.Errorf("failed to read connect response: %w", err)
 			continue
 		}
-		log.Printf("Received connect response: %+v", connectResp)
+		if debugLogging.Load() {
+			log.Printf("Received connect response: %+v", connectResp)
+		}
 
 		if connectResp.Msg != "connected" {
 			conn.Close()
@@ -176,9 +202,16 @@ func (c *Client) readLoop(conn *websocket.Conn) {
 			return
 		}
 
-		respJSON, _ := json.Marshal(resp)
-		log.Printf("Received response: %s", string(respJSON))
-		log.Printf("Result length: %d bytes", len(resp.Result))
+		if debugLogging.Load() {
+			// Full bodies only in debug mode, and even then with known
+			// credential keys masked and any server echo of the API key
+			// scrubbed - responses can carry secrets (e.g. job arguments,
+			// app configs) that the server is not guaranteed to redact.
+			respJSON, _ := json.Marshal(resp)
+			log.Printf("Received response: %s", c.scrubSecrets(string(RedactJSONForLog(respJSON))))
+		} else {
+			log.Printf("Received response: id=%s msg=%s result=%d bytes", resp.ID, resp.Msg, len(resp.Result))
+		}
 
 		// Route response to the waiting caller
 		c.pendingMu.Lock()
@@ -283,6 +316,88 @@ func (c *Client) Call(method string, params ...interface{}) (json.RawMessage, er
 	return c.callRaw(method, params...)
 }
 
+// sensitiveKeyFragments match JSON object keys whose values must never be
+// written to logs or error messages (e.g. bindpw in directoryservices.update).
+var sensitiveKeyFragments = []string{"password", "passwd", "bindpw", "secret", "api_key", "apikey", "token", "credential"}
+
+func isSensitiveKey(key string) bool {
+	k := strings.ToLower(key)
+	for _, fragment := range sensitiveKeyFragments {
+		if strings.Contains(k, fragment) {
+			return true
+		}
+	}
+	return false
+}
+
+// redactValue returns a deep copy of v with values under sensitive keys masked.
+func redactValue(v interface{}) interface{} {
+	switch t := v.(type) {
+	case map[string]interface{}:
+		out := make(map[string]interface{}, len(t))
+		for k, val := range t {
+			if isSensitiveKey(k) {
+				out[k] = "[REDACTED]"
+			} else {
+				out[k] = redactValue(val)
+			}
+		}
+		return out
+	case []interface{}:
+		out := make([]interface{}, len(t))
+		for i, val := range t {
+			out[i] = redactValue(val)
+		}
+		return out
+	default:
+		return v
+	}
+}
+
+// RedactJSONForLog returns raw with values under credential-bearing keys
+// (password, bindpw, secret, ...) replaced by "[REDACTED]". Intended for
+// sanitizing JSON messages before writing them to logs. Returns raw unchanged
+// if it is not valid JSON.
+func RedactJSONForLog(raw []byte) []byte {
+	var v interface{}
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return raw
+	}
+	out, err := json.Marshal(redactValue(v))
+	if err != nil {
+		return raw
+	}
+	return out
+}
+
+// scrubSecrets removes the client's API key from server-supplied text (error
+// messages, traces, response bodies) in case the server echoes it back.
+func (c *Client) scrubSecrets(s string) string {
+	if c.apiKey == "" {
+		return s
+	}
+	return strings.ReplaceAll(s, c.apiKey, "[REDACTED]")
+}
+
+// redactParams returns a copy of params that is safe for logging. Auth methods
+// pass credentials positionally (e.g. auth.login_with_api_key), so every
+// parameter is masked; for all other methods, values under sensitive keys are
+// masked. The original params are never modified.
+func redactParams(method string, params []interface{}) []interface{} {
+	if strings.HasPrefix(method, "auth.") {
+		redacted := make([]interface{}, len(params))
+		for i := range redacted {
+			redacted[i] = "[REDACTED]"
+		}
+		return redacted
+	}
+	redacted := make([]interface{}, len(params))
+	for i, p := range params {
+		redacted[i] = redactValue(p)
+	}
+	return redacted
+}
+
 // callRaw sends a request and waits for its response via the pending map.
 // Safe for concurrent use.
 func (c *Client) callRaw(method string, params ...interface{}) (json.RawMessage, error) {
@@ -342,8 +457,14 @@ func (c *Client) callRaw(method string, params ...interface{}) (json.RawMessage,
 			Params: params,
 		}
 
-		reqJSON, _ := json.Marshal(req)
-		log.Printf("Sending request: %s", string(reqJSON))
+		if debugLogging.Load() {
+			logReq := req
+			logReq.Params = redactParams(method, req.Params)
+			reqJSON, _ := json.Marshal(logReq)
+			log.Printf("Sending request: %s", string(reqJSON))
+		} else {
+			log.Printf("Sending request: id=%s method=%s", id, method)
+		}
 
 		// writeMu ensures only one goroutine writes to the WebSocket at a time
 		c.writeMu.Lock()
@@ -386,13 +507,13 @@ func (c *Client) callRaw(method string, params ...interface{}) (json.RawMessage,
 
 			if resp.Msg == "failed" {
 				if resp.Error != nil {
-					return nil, formatAPIErrorWithContext(resp.Error, method, params)
+					return nil, c.formatAPIErrorWithContext(resp.Error, method, params)
 				}
 				return nil, fmt.Errorf("API call failed with no error details")
 			}
 
 			if resp.Error != nil {
-				return nil, formatAPIErrorWithContext(resp.Error, method, params)
+				return nil, c.formatAPIErrorWithContext(resp.Error, method, params)
 			}
 
 			return resp.Result, nil
@@ -434,39 +555,26 @@ func (c *Client) Close() error {
 	return nil
 }
 
-// formatAPIError formats an API error into a readable error message
-func formatAPIError(apiErr *APIError) error {
-	errMsg := fmt.Sprintf("API error: %s (code %d)", apiErr.Message, apiErr.Code)
-	if apiErr.Trace != nil {
-		if traceStr, ok := apiErr.Trace.(string); ok && traceStr != "" {
-			errMsg = fmt.Sprintf("%s\nTrace: %s", errMsg, traceStr)
-		} else {
-			if traceJSON, err := json.MarshalIndent(apiErr.Trace, "", "  "); err == nil {
-				errMsg = fmt.Sprintf("%s\nTrace: %s", errMsg, string(traceJSON))
-			}
-		}
-	}
-	return fmt.Errorf("%s", errMsg)
-}
-
-// formatAPIErrorWithContext formats API error with request context for debugging
-func formatAPIErrorWithContext(apiErr *APIError, method string, params []interface{}) error {
-	errMsg := fmt.Sprintf("API error: %s (code %d)", apiErr.Message, apiErr.Code)
+// formatAPIErrorWithContext formats API error with request context for
+// debugging. Our own params are redacted, and the server-supplied message and
+// trace are scrubbed of the API key in case the server echoes it back.
+func (c *Client) formatAPIErrorWithContext(apiErr *APIError, method string, params []interface{}) error {
+	errMsg := fmt.Sprintf("API error: %s (code %d)", c.scrubSecrets(apiErr.Message), apiErr.Code)
 
 	errMsg = fmt.Sprintf("%s\n\nRequest:\n  Method: %s", errMsg, method)
 
 	if len(params) > 0 {
-		if paramsJSON, err := json.MarshalIndent(params, "  ", "  "); err == nil {
+		if paramsJSON, err := json.MarshalIndent(redactParams(method, params), "  ", "  "); err == nil {
 			errMsg = fmt.Sprintf("%s\n  Params: %s", errMsg, string(paramsJSON))
 		}
 	}
 
 	if apiErr.Trace != nil {
 		if traceStr, ok := apiErr.Trace.(string); ok && traceStr != "" {
-			errMsg = fmt.Sprintf("%s\n\nTrace: %s", errMsg, traceStr)
+			errMsg = fmt.Sprintf("%s\n\nTrace: %s", errMsg, c.scrubSecrets(traceStr))
 		} else {
-			if traceJSON, err := json.MarshalIndent(apiErr.Trace, "", "  "); err == nil {
-				errMsg = fmt.Sprintf("%s\n\nTrace: %s", errMsg, string(traceJSON))
+			if traceJSON, err := json.MarshalIndent(redactValue(apiErr.Trace), "", "  "); err == nil {
+				errMsg = fmt.Sprintf("%s\n\nTrace: %s", errMsg, c.scrubSecrets(string(traceJSON)))
 			}
 		}
 	}

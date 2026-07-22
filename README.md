@@ -245,8 +245,18 @@ You should now be able to ask TrueNAS questions:
   - ⚠️ **Note**: `ws://` (unencrypted) is **not allowed** - TrueNAS will revoke API keys used over unencrypted connections
 - `--api-key` - TrueNAS API key for authentication (required, or use `TRUENAS_API_KEY` env var)
 - `--insecure` - Skip TLS verification (not needed - self-signed certs accepted by default)
-- `--debug` - Enable debug logging
+- `--debug` - Enable debug logging (or set `TRUENAS_MCP_DEBUG=1`)
 - `--version` - Print version and exit
+
+### Debug Logging
+
+By default, logs written to stderr contain only metadata (method names, request
+IDs, response sizes) - never request or response bodies. Set `TRUENAS_MCP_DEBUG=1`
+(or pass `--debug`) to log full request/response bodies for troubleshooting.
+
+Even in debug mode, credentials are never logged: API keys and other
+credential-bearing values (`password`, `bindpw`, `secret`, `token`, etc.) are
+replaced with `[REDACTED]`, so debug logs are safe to share in bug reports.
 
 ### Examples
 
@@ -259,8 +269,9 @@ export TRUENAS_URL=192.168.0.31
 export TRUENAS_API_KEY=your-api-key
 ./truenas-mcp
 
-# With debug logging
+# With debug logging (full request/response bodies, credentials redacted)
 ./truenas-mcp --truenas-url 192.168.0.31 --api-key your-api-key --debug
+# or: TRUENAS_MCP_DEBUG=1 ./truenas-mcp --truenas-url 192.168.0.31 --api-key your-api-key
 ```
 
 ## Connection Details
@@ -296,6 +307,7 @@ The binary connects directly to TrueNAS middleware's WebSocket endpoint:
 - **Self-signed certificates**: Accepted by default (common for TrueNAS)
 - **Network**: Client-only (no listening ports, all connections outbound)
 - **API Key Storage**: Recommend using environment variables instead of command-line args
+- **Log Safety**: Credentials are redacted from all log output and error messages; full request/response bodies are only logged in debug mode (see [Debug Logging](#debug-logging))
 
 ### Security Best Practices
 

@@ -49,6 +49,13 @@ func main() {
 		log.Fatal("Both --truenas-url and --api-key are required (or set TRUENAS_URL and TRUENAS_API_KEY env vars)")
 	}
 
+	// TRUENAS_MCP_DEBUG=1 is equivalent to --debug; either enables verbose
+	// (credential-redacted) request/response logging everywhere
+	if truenas.DebugLogging() {
+		*debug = true
+	}
+	truenas.SetDebugLogging(*debug)
+
 	// Configure TLS - accept self-signed certs by default (common for TrueNAS)
 	tlsConfig := &tls.Config{
 		InsecureSkipVerify: true,
@@ -114,7 +121,7 @@ func (h *StdioHandler) Run() error {
 	for h.stdin.Scan() {
 		line := h.stdin.Bytes()
 		if h.debug {
-			log.Printf("[STDIN] %s", string(line))
+			log.Printf("[STDIN] %s", truenas.RedactJSONForLog(line))
 		}
 
 		var req mcp.Request
@@ -267,7 +274,7 @@ func (h *StdioHandler) sendResponse(resp *mcp.Response) error {
 	}
 
 	if h.debug {
-		log.Printf("[STDOUT] %s", string(data))
+		log.Printf("[STDOUT] %s", truenas.RedactJSONForLog(data))
 	}
 
 	fmt.Printf("%s\n", data)
