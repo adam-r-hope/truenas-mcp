@@ -78,7 +78,7 @@ TrueNAS MCP provides comprehensive management capabilities through natural langu
 - ✅ No deployment to TrueNAS required
 - ✅ Runs entirely on your desktop
 - ✅ Secure WebSocket connection (wss://) to TrueNAS middleware
-- ✅ Self-signed certificate support (works with TrueNAS defaults)
+- ✅ Self-signed certificate support via `--tls-ca` (works with TrueNAS defaults)
 - ✅ Cross-platform support (macOS, Linux, Windows)
 - ✅ Simple configuration with hostname or full WebSocket URL
 - ✅ API key protection (requires encrypted connections)
@@ -196,6 +196,28 @@ Add the TrueNAS MCP server configuration:
 }
 ```
 
+**TLS with a self-signed certificate:** TrueNAS ships with a self-signed
+certificate by default, and certificate verification is on by default. Either
+export your server's certificate once and trust it (recommended):
+
+```json
+"env": {
+  "TRUENAS_URL": "192.168.0.31",
+  "TRUENAS_API_KEY": "your-api-key-here",
+  "TRUENAS_TLS_CA": "/path/to/truenas-cert.pem"
+}
+```
+
+or explicitly disable verification (not recommended - allows man-in-the-middle
+attacks on your network):
+
+```json
+"env": { "TRUENAS_INSECURE": "1" }
+```
+
+To export the certificate: TrueNAS UI → System Settings → Certificates, or
+`openssl s_client -connect 192.168.0.31:443 </dev/null 2>/dev/null | openssl x509 > truenas-cert.pem`
+
 #### Claude Code
 
 Claude Code uses the `claude mcp` command to configure MCP servers:
@@ -244,7 +266,8 @@ You should now be able to ask TrueNAS questions:
   - Examples: `truenas.local` or `192.168.0.31` (automatically uses `wss://` on port 443)
   - ⚠️ **Note**: `ws://` (unencrypted) is **not allowed** - TrueNAS will revoke API keys used over unencrypted connections
 - `--api-key` - TrueNAS API key for authentication (required, or use `TRUENAS_API_KEY` env var)
-- `--insecure` - Skip TLS verification (not needed - self-signed certs accepted by default)
+- `--tls-ca` - Path to a PEM certificate to trust, e.g. the TrueNAS self-signed certificate (or use `TRUENAS_TLS_CA` env var)
+- `--insecure` - Disable TLS certificate verification entirely (or set `TRUENAS_INSECURE=1`) - **unsafe**: allows man-in-the-middle attacks; prefer `--tls-ca`
 - `--debug` - Enable debug logging (or set `TRUENAS_MCP_DEBUG=1`)
 - `--version` - Print version and exit
 
@@ -281,7 +304,7 @@ export TRUENAS_API_KEY=your-api-key
 The binary connects directly to TrueNAS middleware's WebSocket endpoint:
 
 1. **Uses secure WebSocket (wss://)**: Connects to `wss://your-truenas:443/websocket`
-2. **Self-signed certs accepted**: Works with TrueNAS default self-signed certificates
+2. **Verifies certificates by default**: trust the TrueNAS self-signed certificate with `--tls-ca` (see [TLS with a self-signed certificate](#step-3-configure-your-mcp-client))
 3. **Authenticates via API key**: Uses `auth.login_with_api_key` method
 
 ### ⚠️ Security Requirement
@@ -295,6 +318,10 @@ The binary connects directly to TrueNAS middleware's WebSocket endpoint:
 - Check firewall allows port 443 (wss)
 - Verify API key is valid and has admin permissions
 
+**Certificate Verification Errors** (`x509: certificate signed by unknown authority` or similar):
+- TrueNAS uses a self-signed certificate by default; export it and pass `--tls-ca truenas-cert.pem` (recommended)
+- Or disable verification with `--insecure` / `TRUENAS_INSECURE=1` (unsafe on untrusted networks)
+
 **Authentication Failures:**
 - Generate a new API key in TrueNAS System Settings → API Keys
 - Ensure the key has appropriate permissions
@@ -304,7 +331,7 @@ The binary connects directly to TrueNAS middleware's WebSocket endpoint:
 
 - **Authentication**: TrueNAS API key required for all operations
 - **TLS/SSL**: Only supports wss:// (encrypted) - ws:// is rejected for security
-- **Self-signed certificates**: Accepted by default (common for TrueNAS)
+- **Certificate verification**: On by default; pin a self-signed certificate with `--tls-ca`, or opt out explicitly with `--insecure`
 - **Network**: Client-only (no listening ports, all connections outbound)
 - **API Key Storage**: Recommend using environment variables instead of command-line args
 - **Log Safety**: Credentials are redacted from all log output and error messages; full request/response bodies are only logged in debug mode (see [Debug Logging](#debug-logging))

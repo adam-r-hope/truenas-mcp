@@ -130,6 +130,9 @@ func (c *Client) connect() error {
 		log.Printf("Connecting to %s...", url)
 		conn, _, err := wsDialer.Dial(url, nil)
 		if err != nil {
+			if strings.Contains(err.Error(), "x509:") || strings.Contains(err.Error(), "certificate") {
+				err = fmt.Errorf("%w (TrueNAS uses a self-signed certificate by default: pass --tls-ca <cert.pem> to trust it, or --insecure to disable verification at the cost of man-in-the-middle protection)", err)
+			}
 			log.Printf("Connection failed: %v", err)
 			lastErr = err
 			continue
