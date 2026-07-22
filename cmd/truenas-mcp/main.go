@@ -25,9 +25,9 @@ var (
 	debug      = flag.Bool("debug", false, "Enable debug logging")
 )
 
-const (
-	Version = "0.2.0"
-)
+// Version is the release version, injected at build time via
+// -ldflags "-X main.Version=...". Builds without injection report "dev".
+var Version = "dev"
 
 func main() {
 	flag.Parse()
