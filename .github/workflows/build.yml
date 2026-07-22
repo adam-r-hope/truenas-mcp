@@ -14,6 +14,8 @@ jobs:
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
 
     - name: Set up Go
       uses: actions/setup-go@v5
@@ -59,14 +61,17 @@ jobs:
           coverage.txt
         retention-days: 30
 
+    - name: Set version from git
+      run: echo "VERSION=$(git describe --tags --always | sed 's/^v//')" >> $GITHUB_ENV
+
     - name: Build for macOS ARM64
-      run: GOOS=darwin GOARCH=arm64 go build -o truenas-mcp-darwin-arm64 ./cmd/truenas-mcp
+      run: GOOS=darwin GOARCH=arm64 go build -ldflags "-X main.Version=$VERSION" -o truenas-mcp-darwin-arm64 ./cmd/truenas-mcp
 
     - name: Build for Windows AMD64
-      run: GOOS=windows GOARCH=amd64 go build -o truenas-mcp-windows-amd64.exe ./cmd/truenas-mcp
+      run: GOOS=windows GOARCH=amd64 go build -ldflags "-X main.Version=$VERSION" -o truenas-mcp-windows-amd64.exe ./cmd/truenas-mcp
 
     - name: Build for Linux AMD64
-      run: GOOS=linux GOARCH=amd64 go build -o truenas-mcp-linux-amd64 ./cmd/truenas-mcp
+      run: GOOS=linux GOARCH=amd64 go build -ldflags "-X main.Version=$VERSION" -o truenas-mcp-linux-amd64 ./cmd/truenas-mcp
 
     - name: Upload macOS ARM64 binary
       uses: actions/upload-artifact@v4
