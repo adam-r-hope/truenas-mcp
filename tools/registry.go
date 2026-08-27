@@ -3923,9 +3923,7 @@ func (r *Registry) handleUpdateApp(client *truenas.Client, args map[string]inter
 		return "", fmt.Errorf("storage validation failed: %v", err)
 	}
 
-	result, err := client.Call("app.update", appName, map[string]interface{}{
-		"values": values,
-	})
+	result, err := client.Call("app.update", appName, buildAppUpdateObject(values))
 	if err != nil {
 		return "", fmt.Errorf("failed to update app: %w", err)
 	}

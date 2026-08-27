@@ -2,6 +2,7 @@ package tools
 
 import (
 	"fmt"
+	"reflect"
 	"testing"
 )
 
@@ -1002,5 +1003,126 @@ func TestGenerateWizardGuidance(t *testing.T) {
 		if _, exists := patterns[pattern]; !exists {
 			t.Errorf("Expected pattern %q not found in common_patterns", pattern)
 		}
+	}
+}
+
+// TestBuildAppUpdateObject tests the app.update parameter shaping for both
+// catalog apps and custom Docker Compose apps
+func TestBuildAppUpdateObject(t *testing.T) {
+	composeConfig := map[string]interface{}{
+		"services": map[string]interface{}{
+			"web": map[string]interface{}{"image": "nginx:alpine"},
+		},
+	}
+
+	tests := []struct {
+		name               string
+		values             map[string]interface{}
+		wantValuesEmpty    bool
+		wantComposeConfig  bool
+		wantComposeString  interface{}
+		wantPassthroughKey string
+	}{
+		{
+			name:               "catalog app passes values through unchanged",
+			values:             map[string]interface{}{"TZ": "Europe/London"},
+			wantValuesEmpty:    false,
+			wantComposeConfig:  false,
+			wantPassthroughKey: "TZ",
+		},
+		{
+			name:              "catalog app with empty values",
+			values:            map[string]interface{}{},
+			wantValuesEmpty:   true,
+			wantComposeConfig: false,
+		},
+		{
+			name: "custom app lifts compose config to top level",
+			values: map[string]interface{}{
+				"custom_compose_config": composeConfig,
+			},
+			wantValuesEmpty:   true,
+			wantComposeConfig: true,
+			wantComposeString: "",
+		},
+		{
+			name: "custom app preserves supplied compose string",
+			values: map[string]interface{}{
+				"custom_compose_config":        composeConfig,
+				"custom_compose_config_string": "services:\n  web:\n    image: nginx:alpine\n",
+			},
+			wantValuesEmpty:   true,
+			wantComposeConfig: true,
+			wantComposeString: "services:\n  web:\n    image: nginx:alpine\n",
+		},
+		{
+			name: "compose string alone is not treated as a custom app",
+			values: map[string]interface{}{
+				"custom_compose_config_string": "services: {}",
+			},
+			wantValuesEmpty:    false,
+			wantComposeConfig:  false,
+			wantPassthroughKey: "custom_compose_config_string",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := buildAppUpdateObject(tt.values)
+
+			gotValues, ok := got["values"].(map[string]interface{})
+			if !ok {
+				t.Fatalf("values is not a map, got %T", got["values"])
+			}
+			if (len(gotValues) == 0) != tt.wantValuesEmpty {
+				t.Errorf("values emptiness = %v, want empty %v (values: %v)",
+					len(gotValues) == 0, tt.wantValuesEmpty, gotValues)
+			}
+
+			ccc, hasCCC := got["custom_compose_config"]
+			if hasCCC != tt.wantComposeConfig {
+				t.Errorf("custom_compose_config present = %v, want %v", hasCCC, tt.wantComposeConfig)
+			}
+
+			if tt.wantComposeConfig {
+				if !reflect.DeepEqual(ccc, composeConfig) {
+					t.Errorf("custom_compose_config = %v, want %v", ccc, composeConfig)
+				}
+				ccs, hasCCS := got["custom_compose_config_string"]
+				if !hasCCS {
+					t.Error("custom_compose_config_string missing, want it always set for custom apps")
+				}
+				if ccs != tt.wantComposeString {
+					t.Errorf("custom_compose_config_string = %q, want %q", ccs, tt.wantComposeString)
+				}
+			} else {
+				if _, hasCCS := got["custom_compose_config_string"]; hasCCS {
+					t.Error("custom_compose_config_string set for a catalog app, want it absent")
+				}
+			}
+
+			if tt.wantPassthroughKey != "" {
+				if _, ok := gotValues[tt.wantPassthroughKey]; !ok {
+					t.Errorf("values missing passthrough key %q", tt.wantPassthroughKey)
+				}
+			}
+		})
+	}
+}
+
+// TestBuildAppUpdateObjectDoesNotMutateInput verifies the caller's values map
+// is left untouched, since it is also used for storage validation
+func TestBuildAppUpdateObjectDoesNotMutateInput(t *testing.T) {
+	values := map[string]interface{}{
+		"custom_compose_config": map[string]interface{}{"services": map[string]interface{}{}},
+	}
+
+	buildAppUpdateObject(values)
+
+	if len(values) != 1 {
+		t.Errorf("input map was mutated, len = %d, want 1", len(values))
+	}
+	if _, ok := values["custom_compose_config"]; !ok {
+		t.Error("input map lost custom_compose_config")
 	}
 }

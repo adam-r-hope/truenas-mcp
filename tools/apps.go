@@ -1224,3 +1224,31 @@ func verifyDatasetPathsExist(client *truenas.Client, paths []string) ([]string, 
 
 	return missing, nil
 }
+
+// buildAppUpdateObject builds the update object passed as the second parameter
+// to the app.update API call.
+//
+// Catalog apps carry their configuration in "values" and are passed through
+// unchanged. Custom Docker Compose apps instead expect custom_compose_config
+// and custom_compose_config_string as top-level keys, so those are lifted out
+// of the values map and "values" is emptied. See the app.update API reference.
+func buildAppUpdateObject(values map[string]interface{}) map[string]interface{} {
+	updateObj := map[string]interface{}{
+		"values": values,
+	}
+
+	ccc, hasCCC := values["custom_compose_config"]
+	if !hasCCC {
+		return updateObj
+	}
+
+	updateObj["custom_compose_config"] = ccc
+	updateObj["values"] = map[string]interface{}{}
+	if ccs, hasCCS := values["custom_compose_config_string"]; hasCCS {
+		updateObj["custom_compose_config_string"] = ccs
+	} else {
+		updateObj["custom_compose_config_string"] = ""
+	}
+
+	return updateObj
+}
