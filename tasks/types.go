@@ -33,13 +33,23 @@ type Task struct {
 	TTL           int64      `json:"ttl"`          // Seconds until expiry
 	PollInterval  int64      `json:"pollInterval"` // Seconds between polls
 
+	// Poll health. Polling failures are usually transient, so they are
+	// reported alongside the task rather than ending it, letting callers tell
+	// a slow job apart from one whose status can no longer be reached.
+	LastPolledAt  *time.Time `json:"lastPolledAt,omitempty"`
+	PollErrors    int        `json:"pollErrors,omitempty"`
+	LastPollError string     `json:"lastPollError,omitempty"`
+
+	// Result carries the completed job's return value, such as the app entry
+	// produced by app.create.
+	Result interface{} `json:"result,omitempty"`
+
 	// Internal fields (not exposed in JSON)
 	OperationType OperationType          `json:"-"`
 	JobID         *int                   `json:"-"` // For job-based ops
 	StatusMethod  string                 `json:"-"` // For status-based ops
 	ToolName      string                 `json:"-"`
 	Arguments     map[string]interface{} `json:"-"`
-	Result        interface{}            `json:"-"`
 	Error         error                  `json:"-"`
 }
 

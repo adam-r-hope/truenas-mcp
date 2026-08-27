@@ -52,7 +52,11 @@ func (s *TaskStore) Get(taskID string) (*Task, error) {
 		return nil, fmt.Errorf("task expired: %s", taskID)
 	}
 
-	return task, nil
+	// Return a copy. The poller writes to the stored task from its own
+	// goroutine, so handing out the pointer would let a reader observe a
+	// partially updated task.
+	snapshot := *task
+	return &snapshot, nil
 }
 
 // Update modifies an existing task

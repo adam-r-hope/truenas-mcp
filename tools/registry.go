@@ -1753,13 +1753,18 @@ Returns task_id for tracking progress with tasks_get.
 	r.tools["tasks_get"] = Tool{
 		Definition: mcp.Tool{
 			Name:        "tasks_get",
-			Description: "Get detailed status of a specific task by ID. Use this to track progress of long-running operations.",
+			Description: "Get detailed status of a specific task by ID. Use this to track progress of long-running operations. A completed task also carries the job's result, such as the app entry produced by an install. Poll health is reported through lastPolledAt and pollErrors: a task showing pollErrors is one whose status could not be read, not necessarily one that is failing.",
 			InputSchema: map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{
 					"task_id": map[string]interface{}{
 						"type":        "string",
 						"description": "Task ID to retrieve",
+					},
+					"include_result": map[string]interface{}{
+						"type":        "boolean",
+						"description": "Include the completed job's result payload (default: true). Set false when polling repeatedly, as results can be large.",
+						"default":     true,
 					},
 				},
 				"required": []string{"task_id"},
@@ -4952,6 +4957,10 @@ func (r *Registry) handleTasksGet(client *truenas.Client, args map[string]interf
 	task, err := r.taskManager.Get(taskID)
 	if err != nil {
 		return "", fmt.Errorf("failed to get task: %w", err)
+	}
+
+	if include, ok := args["include_result"].(bool); ok && !include {
+		task.Result = nil
 	}
 
 	formatted, _ := json.MarshalIndent(task, "", "  ")

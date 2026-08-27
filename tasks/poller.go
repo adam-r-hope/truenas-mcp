@@ -65,19 +65,22 @@ func (p *Poller) pollJobTask(task *Task) {
 		[]interface{}{"id", "=", *task.JobID},
 	})
 	if err != nil {
-		// Don't fail the task on network errors, just skip this poll
+		p.recordPollFailure(task, err)
 		return
 	}
 
 	var jobs []map[string]interface{}
 	if err := json.Unmarshal(result, &jobs); err != nil {
+		p.recordPollFailure(task, fmt.Errorf("could not parse job status: %w", err))
 		return
 	}
 
 	if len(jobs) == 0 {
+		p.recordPollFailure(task, fmt.Errorf("job %d not found", *task.JobID))
 		return
 	}
 
+	p.recordPollSuccess(task)
 	p.updateTaskFromJob(task, jobs[0])
 }
 
@@ -90,14 +93,17 @@ func (p *Poller) pollStatusTask(task *Task) {
 	// Call the status method
 	result, err := p.client.Call(task.StatusMethod)
 	if err != nil {
+		p.recordPollFailure(task, err)
 		return
 	}
 
 	var status map[string]interface{}
 	if err := json.Unmarshal(result, &status); err != nil {
+		p.recordPollFailure(task, fmt.Errorf("could not parse status response: %w", err))
 		return
 	}
 
+	p.recordPollSuccess(task)
 	p.updateTaskFromStatus(task, status)
 }
 
@@ -114,14 +120,7 @@ func (p *Poller) updateTaskFromJob(task *Task, job map[string]interface{}) {
 	switch state {
 	case "RUNNING", "WAITING":
 		newStatus = TaskStatusWorking
-		if progress, ok := job["progress"].(map[string]interface{}); ok {
-			if percent, ok := progress["percent"].(float64); ok {
-				statusMessage = fmt.Sprintf("Progress: %.1f%%", percent)
-			}
-			if desc, ok := progress["description"].(string); ok && desc != "" {
-				statusMessage = desc
-			}
-		}
+		statusMessage = jobProgressMessage(job)
 
 	case "SUCCESS":
 		newStatus = TaskStatusCompleted
@@ -203,5 +202,62 @@ func (p *Poller) updateTaskFromStatus(task *Task, status map[string]interface{})
 		task.StatusMessage = statusMessage
 		task.Result = status
 		p.store.Update(task)
+	}
+}
+
+// jobProgressMessage builds a progress line from a job's progress object.
+// A job usually reports both a description and a percentage; keep them
+// together rather than letting one overwrite the other.
+func jobProgressMessage(job map[string]interface{}) string {
+	progress, ok := job["progress"].(map[string]interface{})
+	if !ok {
+		return ""
+	}
+
+	desc, _ := progress["description"].(string)
+	percent, hasPercent := progress["percent"].(float64)
+
+	switch {
+	case desc != "" && hasPercent:
+		return fmt.Sprintf("%s (%.0f%%)", desc, percent)
+	case desc != "":
+		return desc
+	case hasPercent:
+		return fmt.Sprintf("Progress: %.0f%%", percent)
+	default:
+		return ""
+	}
+}
+
+// recordPollFailure notes a failed poll attempt. The middleware connection can
+// drop transiently, so a task stays active and keeps being polled; it recovers
+// on its own once the connection returns. Reporting the failure on the task
+// lets callers tell a slow job apart from one that can no longer be reached.
+//
+// When MaxPollAttempts is configured, a task that fails that many consecutive
+// polls is marked failed rather than reporting "working" indefinitely.
+func (p *Poller) recordPollFailure(task *Task, err error) {
+	task.PollErrors++
+	task.LastPollError = err.Error()
+
+	if p.config.MaxPollAttempts > 0 && task.PollErrors >= p.config.MaxPollAttempts {
+		task.Status = TaskStatusFailed
+		task.StatusMessage = fmt.Sprintf(
+			"Stopped polling after %d consecutive failures; the job may still be running on TrueNAS. Last error: %v",
+			task.PollErrors, err)
+	}
+
+	p.store.Update(task)
+}
+
+// recordPollSuccess clears the poll failure state after the status is read
+// successfully.
+func (p *Poller) recordPollSuccess(task *Task) {
+	now := time.Now()
+	task.LastPolledAt = &now
+
+	if task.PollErrors > 0 {
+		task.PollErrors = 0
+		task.LastPollError = ""
 	}
 }
