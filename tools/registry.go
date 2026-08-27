@@ -1576,6 +1576,34 @@ install_app(
 
 Returns task_id for tracking progress with tasks_get.
 
+**CUSTOM DOCKER COMPOSE APPS**
+
+The steps above describe catalog apps. To install your own compose file instead,
+set custom_app=true and put the compose configuration in values. There is no
+catalog schema, so steps 1-7 do not apply and catalog_app, train and version are
+omitted:
+
+install_app(
+  app_name="whoami",
+  custom_app=true,
+  values={
+    "custom_compose_config": {
+      "services": {
+        "whoami": {
+          "image": "traefik/whoami:latest",
+          "ports": ["18080:80"],
+          "restart": "unless-stopped"
+        }
+      }
+    }
+  }
+)
+
+Use values.custom_compose_config_string instead to supply the compose file as a
+YAML string. Storage for custom apps is declared as normal compose volumes, so
+the host_path rules below do not apply and datasets are not pre-verified; create
+any bind-mount datasets with create_dataset first.
+
 **CRITICAL SAFETY RULES:**
 - ALWAYS use "type": "host_path" for storage
 - NEVER use "type": "ix_volume"
@@ -1598,7 +1626,12 @@ Returns task_id for tracking progress with tasks_get.
 					},
 					"catalog_app": map[string]interface{}{
 						"type":        "string",
-						"description": "Catalog app name (from search results)",
+						"description": "Catalog app name (from search results). Required unless custom_app is true.",
+					},
+					"custom_app": map[string]interface{}{
+						"type":        "boolean",
+						"description": "Install a custom Docker Compose app instead of a catalog app. When true, supply the compose file in values.custom_compose_config (object) or values.custom_compose_config_string (YAML), and omit catalog_app, train and version. Inferred as true when values carries a compose config.",
+						"default":     false,
 					},
 					"train": map[string]interface{}{
 						"type":        "string",
@@ -1613,7 +1646,7 @@ Returns task_id for tracking progress with tasks_get.
 					},
 					"values": map[string]interface{}{
 						"type":        "object",
-						"description": "Complete app configuration assembled from schema groups. Includes TZ, run_as, network, storage (host_path only), labels, and resources. Build this by iterating through schema groups from get_app_catalog_details.",
+						"description": "For catalog apps: complete app configuration assembled from schema groups. Includes TZ, run_as, network, storage (host_path only), labels, and resources. Build this by iterating through schema groups from get_app_catalog_details. For custom apps: carries custom_compose_config and/or custom_compose_config_string instead.",
 					},
 					"dry_run": map[string]interface{}{
 						"type":        "boolean",
@@ -1621,7 +1654,7 @@ Returns task_id for tracking progress with tasks_get.
 						"default":     false,
 					},
 				},
-				"required": []string{"app_name", "catalog_app", "values"},
+				"required": []string{"app_name", "values"},
 			},
 		},
 		Handler: r.handleInstallAppWithDryRun,

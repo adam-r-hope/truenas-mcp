@@ -2,6 +2,7 @@ package tools
 
 import (
 	"fmt"
+	"reflect"
 	"testing"
 )
 
@@ -1002,5 +1003,339 @@ func TestGenerateWizardGuidance(t *testing.T) {
 		if _, exists := patterns[pattern]; !exists {
 			t.Errorf("Expected pattern %q not found in common_patterns", pattern)
 		}
+	}
+}
+
+// TestIsCustomAppInstall tests detection of custom compose app installs
+func TestIsCustomAppInstall(t *testing.T) {
+	composeConfig := map[string]interface{}{
+		"services": map[string]interface{}{
+			"whoami": map[string]interface{}{"image": "traefik/whoami:latest"},
+		},
+	}
+
+	tests := []struct {
+		name   string
+		args   map[string]interface{}
+		values map[string]interface{}
+		want   bool
+	}{
+		{
+			name:   "catalog install",
+			args:   map[string]interface{}{"catalog_app": "plex"},
+			values: map[string]interface{}{"TZ": "Europe/London"},
+			want:   false,
+		},
+		{
+			name:   "explicit custom_app flag",
+			args:   map[string]interface{}{"custom_app": true},
+			values: map[string]interface{}{"custom_compose_config": composeConfig},
+			want:   true,
+		},
+		{
+			name:   "inferred from compose config",
+			args:   map[string]interface{}{},
+			values: map[string]interface{}{"custom_compose_config": composeConfig},
+			want:   true,
+		},
+		{
+			name:   "inferred from compose string",
+			args:   map[string]interface{}{},
+			values: map[string]interface{}{"custom_compose_config_string": "services: {}"},
+			want:   true,
+		},
+		{
+			name:   "empty compose string is not a custom app",
+			args:   map[string]interface{}{},
+			values: map[string]interface{}{"custom_compose_config_string": ""},
+			want:   false,
+		},
+		{
+			name:   "custom_app false with catalog values",
+			args:   map[string]interface{}{"custom_app": false, "catalog_app": "plex"},
+			values: map[string]interface{}{"TZ": "Europe/London"},
+			want:   false,
+		},
+		{
+			name:   "custom_app false is overridden by a compose config",
+			args:   map[string]interface{}{"custom_app": false},
+			values: map[string]interface{}{"custom_compose_config": composeConfig},
+			want:   true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isCustomAppInstall(tt.args, tt.values); got != tt.want {
+				t.Errorf("isCustomAppInstall() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestValidateCustomComposeValues tests compose configuration validation
+func TestValidateCustomComposeValues(t *testing.T) {
+	tests := []struct {
+		name      string
+		values    map[string]interface{}
+		wantError bool
+	}{
+		{
+			"valid compose object",
+			map[string]interface{}{
+				"custom_compose_config": map[string]interface{}{"services": map[string]interface{}{}},
+			},
+			false,
+		},
+		{
+			"valid compose string",
+			map[string]interface{}{"custom_compose_config_string": "services:\n  web:\n    image: nginx\n"},
+			false,
+		},
+		{
+			"compose config of wrong type",
+			map[string]interface{}{"custom_compose_config": "services: {}"},
+			true,
+		},
+		{
+			"empty compose string",
+			map[string]interface{}{"custom_compose_config_string": ""},
+			true,
+		},
+		{
+			"no compose configuration at all",
+			map[string]interface{}{"TZ": "Europe/London"},
+			true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateCustomComposeValues(tt.values)
+			if (err != nil) != tt.wantError {
+				t.Errorf("validateCustomComposeValues() error = %v, wantError %v", err, tt.wantError)
+			}
+		})
+	}
+}
+
+// TestBuildCustomAppCreateParams tests the app.create payload for custom apps
+func TestBuildCustomAppCreateParams(t *testing.T) {
+	composeConfig := map[string]interface{}{
+		"services": map[string]interface{}{
+			"whoami": map[string]interface{}{"image": "traefik/whoami:latest"},
+		},
+	}
+
+	t.Run("compose object", func(t *testing.T) {
+		params := buildCustomAppCreateParams("whoami", map[string]interface{}{
+			"custom_compose_config": composeConfig,
+		})
+
+		if params["app_name"] != "whoami" {
+			t.Errorf("app_name = %v, want whoami", params["app_name"])
+		}
+		if params["custom_app"] != true {
+			t.Errorf("custom_app = %v, want true", params["custom_app"])
+		}
+		if !reflect.DeepEqual(params["custom_compose_config"], composeConfig) {
+			t.Errorf("custom_compose_config = %v, want %v", params["custom_compose_config"], composeConfig)
+		}
+		if params["custom_compose_config_string"] != "" {
+			t.Errorf("custom_compose_config_string = %q, want empty", params["custom_compose_config_string"])
+		}
+		vals, ok := params["values"].(map[string]interface{})
+		if !ok || len(vals) != 0 {
+			t.Errorf("values = %v, want an empty map", params["values"])
+		}
+		// catalog-only keys must not leak into a custom app payload
+		for _, key := range []string{"catalog_app", "train", "version"} {
+			if _, present := params[key]; present {
+				t.Errorf("params must not carry %q for a custom app", key)
+			}
+		}
+	})
+
+	t.Run("compose string", func(t *testing.T) {
+		yaml := "services:\n  web:\n    image: nginx:alpine\n"
+		params := buildCustomAppCreateParams("web", map[string]interface{}{
+			"custom_compose_config_string": yaml,
+		})
+
+		if params["custom_compose_config_string"] != yaml {
+			t.Errorf("custom_compose_config_string = %q, want %q", params["custom_compose_config_string"], yaml)
+		}
+		if _, present := params["custom_compose_config"]; present {
+			t.Error("custom_compose_config must be absent when only a string is supplied")
+		}
+	})
+}
+
+// TestParseComposePortSpec tests short-syntax compose port parsing
+func TestParseComposePortSpec(t *testing.T) {
+	tests := []struct {
+		spec string
+		want []int
+	}{
+		{"18080:80", []int{18080}},
+		{"162:162/udp", []int{162}},
+		{"127.0.0.1:8080:80", []int{8080}},
+		{"0.0.0.0:8082:5000/tcp", []int{8082}},
+		{"8000-8002:80", []int{8000, 8001, 8002}},
+		{"80", nil},           // container port only, host port is assigned
+		{"", nil},             // malformed
+		{"abc:80", nil},       // non-numeric host side
+		{"8002-8000:80", nil}, // descending range
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.spec, func(t *testing.T) {
+			got := parseComposePortSpec(tt.spec)
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("parseComposePortSpec(%q) = %v, want %v", tt.spec, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestExtractComposeHostPorts tests host port extraction from both port syntaxes
+func TestExtractComposeHostPorts(t *testing.T) {
+	tests := []struct {
+		name  string
+		ports interface{}
+		want  []int
+	}{
+		{
+			"short syntax",
+			[]interface{}{"18080:80", "162:162/udp"},
+			[]int{18080, 162},
+		},
+		{
+			"long syntax with numeric published",
+			[]interface{}{map[string]interface{}{"target": float64(80), "published": float64(8080)}},
+			[]int{8080},
+		},
+		{
+			"long syntax with quoted published",
+			[]interface{}{map[string]interface{}{"target": float64(80), "published": "8080"}},
+			[]int{8080},
+		},
+		{"no ports declared", nil, nil},
+		{"not a list", "18080:80", nil},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := extractComposeHostPorts(tt.ports)
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("extractComposeHostPorts() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestExtractComposeBindMounts tests bind mount extraction, including the
+// relative paths a custom app may legitimately use
+func TestExtractComposeBindMounts(t *testing.T) {
+	tests := []struct {
+		name    string
+		volumes interface{}
+		want    []string
+	}{
+		{
+			"absolute host path",
+			[]interface{}{"/mnt/pool/apps/data:/data"},
+			[]string{"/mnt/pool/apps/data"},
+		},
+		{
+			"relative host path is still a bind mount",
+			[]interface{}{"./checkmk:/sites"},
+			[]string{"./checkmk"},
+		},
+		{
+			"named volume is not a bind mount",
+			[]interface{}{"appdata:/data"},
+			nil,
+		},
+		{
+			"long syntax bind",
+			[]interface{}{map[string]interface{}{
+				"type": "bind", "source": "/mnt/pool/x", "target": "/data"}},
+			[]string{"/mnt/pool/x"},
+		},
+		{
+			"long syntax named volume is skipped",
+			[]interface{}{map[string]interface{}{
+				"type": "volume", "source": "appdata", "target": "/data"}},
+			nil,
+		},
+		{"no volumes", nil, nil},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := extractComposeBindMounts(tt.volumes)
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("extractComposeBindMounts() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestDescribeComposeServices tests the compose summary used by the dry run
+func TestDescribeComposeServices(t *testing.T) {
+	compose := map[string]interface{}{
+		"services": map[string]interface{}{
+			"web": map[string]interface{}{
+				"image":   "nginx:alpine",
+				"ports":   []interface{}{"8080:80"},
+				"volumes": []interface{}{"/mnt/pool/web:/usr/share/nginx/html"},
+			},
+			"db": map[string]interface{}{
+				"image": "postgres:16",
+			},
+		},
+	}
+
+	got := describeComposeServices(compose)
+	if len(got) != 2 {
+		t.Fatalf("got %d services, want 2", len(got))
+	}
+	// services are reported in a stable order
+	if got[0].Name != "db" || got[1].Name != "web" {
+		t.Errorf("services not sorted by name: %v, %v", got[0].Name, got[1].Name)
+	}
+	if got[1].Image != "nginx:alpine" {
+		t.Errorf("web image = %q, want nginx:alpine", got[1].Image)
+	}
+	if !reflect.DeepEqual(got[1].HostPorts, []int{8080}) {
+		t.Errorf("web host ports = %v, want [8080]", got[1].HostPorts)
+	}
+	if !reflect.DeepEqual(got[1].BindMounts, []string{"/mnt/pool/web"}) {
+		t.Errorf("web bind mounts = %v, want [/mnt/pool/web]", got[1].BindMounts)
+	}
+	if len(got[0].HostPorts) != 0 {
+		t.Errorf("db should declare no host ports, got %v", got[0].HostPorts)
+	}
+}
+
+// TestDescribeComposeServicesMalformed verifies malformed compose input is
+// tolerated rather than panicking
+func TestDescribeComposeServicesMalformed(t *testing.T) {
+	cases := []map[string]interface{}{
+		{},
+		{"services": "not-a-map"},
+		{"services": map[string]interface{}{"web": "not-a-map"}},
+	}
+
+	for i, compose := range cases {
+		t.Run(fmt.Sprintf("case%d", i), func(t *testing.T) {
+			got := describeComposeServices(compose)
+			for _, svc := range got {
+				if svc.Name == "" {
+					t.Error("service summary missing a name")
+				}
+			}
+		})
 	}
 }

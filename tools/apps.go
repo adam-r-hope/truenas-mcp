@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -457,10 +459,7 @@ func handleInstallApp(client *truenas.Client, args map[string]interface{}, taskM
 		return "", fmt.Errorf("app_name is required")
 	}
 
-	catalogApp, ok := args["catalog_app"].(string)
-	if !ok || catalogApp == "" {
-		return "", fmt.Errorf("catalog_app is required")
-	}
+	catalogApp, _ := args["catalog_app"].(string)
 
 	train := "stable"
 	if t, ok := args["train"].(string); ok && t != "" {
@@ -483,33 +482,49 @@ func handleInstallApp(client *truenas.Client, args map[string]interface{}, taskM
 		return "", fmt.Errorf("values parameter is required. Use get_app_catalog_details to see the schema and build the configuration")
 	}
 
-	// CRITICAL SECURITY: Enforce host-path-only storage
-	if err := enforceHostPathStorage(values); err != nil {
-		return "", fmt.Errorf("storage validation failed: %v", err)
-	}
+	customApp := isCustomAppInstall(args, values)
 
-	// Extract storage paths for dataset verification
-	storagePaths := extractStoragePathsFromValues(values)
-
-	// Verify datasets exist
-	if len(storagePaths) > 0 {
-		missing, err := verifyDatasetPathsExist(client, storagePaths)
-		if err != nil {
-			return "", fmt.Errorf("failed to verify datasets: %v", err)
+	var params map[string]interface{}
+	if customApp {
+		// Custom compose apps carry a compose file rather than a catalog
+		// schema, so the storage schema checks below do not apply. Bind
+		// mounts are declared inside the compose file itself.
+		if err := validateCustomComposeValues(values); err != nil {
+			return "", err
 		}
-		if len(missing) > 0 {
-			return "", fmt.Errorf("datasets must exist before installation. Missing:\n%s\n\nUse create_dataset tool first.",
-				strings.Join(missing, "\n  - "))
+		params = buildCustomAppCreateParams(appName, values)
+	} else {
+		if catalogApp == "" {
+			return "", fmt.Errorf("catalog_app is required when installing from the catalog. For a custom Docker Compose app, set custom_app=true and supply custom_compose_config in values")
 		}
-	}
 
-	// Call app.create API
-	params := map[string]interface{}{
-		"app_name":    appName,
-		"catalog_app": catalogApp,
-		"train":       train,
-		"version":     version,
-		"values":      values,
+		// CRITICAL SECURITY: Enforce host-path-only storage
+		if err := enforceHostPathStorage(values); err != nil {
+			return "", fmt.Errorf("storage validation failed: %v", err)
+		}
+
+		// Extract storage paths for dataset verification
+		storagePaths := extractStoragePathsFromValues(values)
+
+		// Verify datasets exist
+		if len(storagePaths) > 0 {
+			missing, err := verifyDatasetPathsExist(client, storagePaths)
+			if err != nil {
+				return "", fmt.Errorf("failed to verify datasets: %v", err)
+			}
+			if len(missing) > 0 {
+				return "", fmt.Errorf("datasets must exist before installation. Missing:\n%s\n\nUse create_dataset tool first.",
+					strings.Join(missing, "\n  - "))
+			}
+		}
+
+		params = map[string]interface{}{
+			"app_name":    appName,
+			"catalog_app": catalogApp,
+			"train":       train,
+			"version":     version,
+			"values":      values,
+		}
 	}
 
 	result, err := client.Call("app.create", params)
@@ -545,14 +560,17 @@ func handleInstallApp(client *truenas.Client, args map[string]interface{}, taskM
 
 	response := map[string]interface{}{
 		"app_name":      appName,
-		"catalog_app":   catalogApp,
-		"train":         train,
-		"version":       version,
+		"custom_app":    customApp,
 		"task_id":       task.TaskID,
 		"task_status":   task.Status,
 		"poll_interval": task.PollInterval,
 		"job_id":        jobID,
 		"message":       fmt.Sprintf("Installation started. Track progress with tasks_get using task_id: %s", task.TaskID),
+	}
+	if !customApp {
+		response["catalog_app"] = catalogApp
+		response["train"] = train
+		response["version"] = version
 	}
 
 	formatted, err := json.MarshalIndent(response, "", "  ")
@@ -568,8 +586,8 @@ type installAppDryRun struct{}
 
 func (d *installAppDryRun) ExecuteDryRun(client *truenas.Client, args map[string]interface{}) (*DryRunResult, error) {
 	// Extract parameters
-	appName := args["app_name"].(string)
-	catalogApp := args["catalog_app"].(string)
+	appName, _ := args["app_name"].(string)
+	catalogApp, _ := args["catalog_app"].(string)
 	train := "stable"
 	if t, ok := args["train"].(string); ok && t != "" {
 		train = t
@@ -584,6 +602,16 @@ func (d *installAppDryRun) ExecuteDryRun(client *truenas.Client, args map[string
 	valuesParam, ok := args["values"].(map[string]interface{})
 	if !ok {
 		return nil, fmt.Errorf("values parameter is required. Use get_app_catalog_details to see the schema")
+	}
+
+	// Custom compose apps have no catalog schema, so they are previewed from
+	// the compose file rather than from catalog metadata.
+	if isCustomAppInstall(args, valuesParam) {
+		return customAppInstallDryRun(client, appName, valuesParam)
+	}
+
+	if catalogApp == "" {
+		return nil, fmt.Errorf("catalog_app is required when installing from the catalog. For a custom Docker Compose app, set custom_app=true and supply custom_compose_config in values")
 	}
 
 	// Validate storage security
@@ -1223,4 +1251,330 @@ func verifyDatasetPathsExist(client *truenas.Client, paths []string) ([]string, 
 	}
 
 	return missing, nil
+}
+
+// isCustomAppInstall reports whether an install request describes a custom
+// Docker Compose app rather than a catalog install. It is true when custom_app
+// is set explicitly, and is inferred when a compose config is supplied in
+// values so callers can stay consistent with the update_app tool.
+func isCustomAppInstall(args map[string]interface{}, values map[string]interface{}) bool {
+	if custom, ok := args["custom_app"].(bool); ok && custom {
+		return true
+	}
+	if _, ok := values["custom_compose_config"]; ok {
+		return true
+	}
+	if ccs, ok := values["custom_compose_config_string"].(string); ok && ccs != "" {
+		return true
+	}
+	return false
+}
+
+// validateCustomComposeValues checks that a custom app install carries a
+// compose configuration in one of the two forms the API accepts.
+func validateCustomComposeValues(values map[string]interface{}) error {
+	if ccc, ok := values["custom_compose_config"]; ok {
+		if _, ok := ccc.(map[string]interface{}); !ok {
+			return fmt.Errorf("custom_compose_config must be an object, got %T", ccc)
+		}
+		return nil
+	}
+	if ccs, ok := values["custom_compose_config_string"].(string); ok && ccs != "" {
+		return nil
+	}
+	return fmt.Errorf("custom app requires custom_compose_config (object) or custom_compose_config_string (YAML) in values")
+}
+
+// buildCustomAppCreateParams builds the app.create payload for a custom Docker
+// Compose app. The compose configuration is passed as top-level keys with an
+// empty values object, and catalog_app, train and version do not apply.
+func buildCustomAppCreateParams(appName string, values map[string]interface{}) map[string]interface{} {
+	params := map[string]interface{}{
+		"app_name":   appName,
+		"custom_app": true,
+		"values":     map[string]interface{}{},
+	}
+
+	if ccc, ok := values["custom_compose_config"]; ok {
+		params["custom_compose_config"] = ccc
+	}
+	if ccs, ok := values["custom_compose_config_string"]; ok {
+		params["custom_compose_config_string"] = ccs
+	} else {
+		params["custom_compose_config_string"] = ""
+	}
+
+	return params
+}
+
+// composeServiceSummary describes one service in a custom app's compose file,
+// for reporting in a dry run.
+type composeServiceSummary struct {
+	Name       string   `json:"name"`
+	Image      string   `json:"image,omitempty"`
+	HostPorts  []int    `json:"host_ports,omitempty"`
+	BindMounts []string `json:"bind_mounts,omitempty"`
+}
+
+// composeConfigFromValues returns the compose configuration object supplied in
+// an install or update request, if it is present in structured form.
+func composeConfigFromValues(values map[string]interface{}) (map[string]interface{}, bool) {
+	ccc, ok := values["custom_compose_config"].(map[string]interface{})
+	return ccc, ok
+}
+
+// describeComposeServices summarises the services declared in a compose
+// configuration. Compose supplied as a YAML string is not parsed, so an empty
+// summary does not imply the app declares nothing.
+func describeComposeServices(compose map[string]interface{}) []composeServiceSummary {
+	services, ok := compose["services"].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+
+	names := make([]string, 0, len(services))
+	for name := range services {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	summaries := make([]composeServiceSummary, 0, len(names))
+	for _, name := range names {
+		summary := composeServiceSummary{Name: name}
+		if svc, ok := services[name].(map[string]interface{}); ok {
+			summary.Image, _ = svc["image"].(string)
+			summary.HostPorts = extractComposeHostPorts(svc["ports"])
+			summary.BindMounts = extractComposeBindMounts(svc["volumes"])
+		}
+		summaries = append(summaries, summary)
+	}
+
+	return summaries
+}
+
+// extractComposeHostPorts returns the host ports published by a service, from
+// either the short ("8080:80") or long ({"published": 8080}) port syntax.
+func extractComposeHostPorts(portsValue interface{}) []int {
+	entries, ok := portsValue.([]interface{})
+	if !ok {
+		return nil
+	}
+
+	var ports []int
+	for _, entry := range entries {
+		switch p := entry.(type) {
+		case string:
+			ports = append(ports, parseComposePortSpec(p)...)
+		case map[string]interface{}:
+			if published, ok := composeNumber(p["published"]); ok {
+				ports = append(ports, published)
+			}
+		}
+	}
+
+	return ports
+}
+
+// parseComposePortSpec parses a short-syntax compose port mapping, returning
+// the host ports it publishes. A spec with no host side ("80") publishes
+// nothing predictable and yields no ports.
+func parseComposePortSpec(spec string) []int {
+	spec = strings.TrimSpace(spec)
+	if idx := strings.Index(spec, "/"); idx >= 0 { // drop /tcp or /udp
+		spec = spec[:idx]
+	}
+
+	parts := strings.Split(spec, ":")
+	var hostPart string
+	switch len(parts) {
+	case 2: // host:container
+		hostPart = parts[0]
+	case 3: // ip:host:container
+		hostPart = parts[1]
+	default: // container port only, or unrecognised
+		return nil
+	}
+
+	// A host side may be a range, e.g. 8000-8002:80
+	if lo, hi, ok := parsePortRange(hostPart); ok {
+		ports := make([]int, 0, hi-lo+1)
+		for p := lo; p <= hi; p++ {
+			ports = append(ports, p)
+		}
+		return ports
+	}
+
+	if port, err := strconv.Atoi(hostPart); err == nil && port > 0 {
+		return []int{port}
+	}
+
+	return nil
+}
+
+// parsePortRange parses a "lo-hi" port range, returning false when the value
+// is not a well-formed ascending range.
+func parsePortRange(value string) (int, int, bool) {
+	lo, hi, found := strings.Cut(value, "-")
+	if !found {
+		return 0, 0, false
+	}
+
+	loPort, err := strconv.Atoi(lo)
+	if err != nil {
+		return 0, 0, false
+	}
+	hiPort, err := strconv.Atoi(hi)
+	if err != nil {
+		return 0, 0, false
+	}
+	if loPort <= 0 || hiPort < loPort {
+		return 0, 0, false
+	}
+
+	return loPort, hiPort, true
+}
+
+// composeNumber reads a compose value that may be given as a number or a
+// quoted string.
+func composeNumber(value interface{}) (int, bool) {
+	switch v := value.(type) {
+	case float64:
+		return int(v), true
+	case int:
+		return v, true
+	case string:
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
+			return n, true
+		}
+	}
+	return 0, false
+}
+
+// extractComposeBindMounts returns the host side of a service's bind mounts,
+// from either the short ("/mnt/pool/data:/data") or long ({"source": ...})
+// volume syntax. Named volumes have no host path and are skipped.
+func extractComposeBindMounts(volumesValue interface{}) []string {
+	entries, ok := volumesValue.([]interface{})
+	if !ok {
+		return nil
+	}
+
+	var mounts []string
+	for _, entry := range entries {
+		switch v := entry.(type) {
+		case string:
+			host, _, found := strings.Cut(v, ":")
+			if found && isBindMountSource(host) {
+				mounts = append(mounts, host)
+			}
+		case map[string]interface{}:
+			if v["type"] != nil && v["type"] != "bind" {
+				continue
+			}
+			if source, ok := v["source"].(string); ok && isBindMountSource(source) {
+				mounts = append(mounts, source)
+			}
+		}
+	}
+
+	return mounts
+}
+
+// isBindMountSource reports whether a volume source is a host path rather than
+// a named volume.
+func isBindMountSource(source string) bool {
+	return strings.HasPrefix(source, "/") || strings.HasPrefix(source, "./") ||
+		strings.HasPrefix(source, "../") || strings.HasPrefix(source, "~/")
+}
+
+// appInstanceExists reports whether an app instance name is already taken.
+func appInstanceExists(client *truenas.Client, appName string) bool {
+	result, err := client.Call("app.query",
+		[]interface{}{
+			[]interface{}{"name", "=", appName},
+		},
+		map[string]interface{}{},
+	)
+	if err != nil {
+		return false
+	}
+
+	var apps []interface{}
+	if json.Unmarshal(result, &apps) != nil {
+		return false
+	}
+
+	return len(apps) > 0
+}
+
+// customAppInstallDryRun previews a custom Docker Compose app installation.
+// It applies the same validation as the install itself, so a malformed request
+// is reported here rather than failing once the job is running.
+func customAppInstallDryRun(client *truenas.Client, appName string, values map[string]interface{}) (*DryRunResult, error) {
+	if err := validateCustomComposeValues(values); err != nil {
+		return nil, err
+	}
+
+	appExists := appInstanceExists(client, appName)
+
+	currentState := map[string]interface{}{
+		"app_exists": appExists,
+		"custom_app": true,
+	}
+
+	description := fmt.Sprintf("Install custom app %s", appName)
+	warnings := []string{}
+
+	if compose, ok := composeConfigFromValues(values); ok {
+		services := describeComposeServices(compose)
+		currentState["services"] = services
+		if len(services) == 0 {
+			warnings = append(warnings, "Compose configuration declares no services.")
+		} else {
+			description = fmt.Sprintf("Install custom app %s (%d service(s))", appName, len(services))
+		}
+		for _, svc := range services {
+			if svc.Image == "" {
+				warnings = append(warnings, fmt.Sprintf("Service %q declares no image.", svc.Name))
+			}
+		}
+	} else {
+		currentState["compose_format"] = "yaml_string"
+		warnings = append(warnings, "Compose supplied as a YAML string is not inspected; it is validated by TrueNAS during installation.")
+	}
+
+	if appExists {
+		warnings = append(warnings, fmt.Sprintf("WARNING: App instance '%s' already exists. Installation will fail.", appName))
+	}
+	warnings = append(warnings, "Storage for custom apps is declared in the compose file. Create any bind-mount datasets with create_dataset first.")
+
+	return &DryRunResult{
+		Tool:         "install_app",
+		CurrentState: currentState,
+		PlannedActions: []PlannedAction{
+			{
+				Step:        1,
+				Description: description,
+				Operation:   "create",
+				Target:      "app.create",
+				Details: map[string]interface{}{
+					"app_name":   appName,
+					"custom_app": true,
+				},
+			},
+		},
+		Warnings: warnings,
+		Requirements: &Requirements{
+			Conditions: []string{
+				"Compose images must be pullable from their registries",
+				"Any bind-mount host paths must exist",
+				"No existing app with the same instance name",
+			},
+		},
+		EstimatedTime: &EstimatedTime{
+			MinSeconds: 30,
+			MaxSeconds: 300,
+			Note:       "Time varies based on container image size and network speed",
+		},
+	}, nil
 }
